@@ -1,0 +1,7 @@
+virtual_ledger_200.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.egg-info/
