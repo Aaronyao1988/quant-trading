@@ -1,6 +1,11 @@
 # Local secrets and runtime state (never commit)
 .env
 virtual_ledger_200.json
+virtual_ledger_200.backup.*.json
+replay_last_run.json
+replay_run.log
+loop_1h_mac.*
+once_preflight.log
 
 __pycache__/
 *.pyc
