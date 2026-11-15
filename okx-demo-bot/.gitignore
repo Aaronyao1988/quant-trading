@@ -1,0 +1,9 @@
+# Local secrets and runtime state (never commit)
+.env
+virtual_ledger_200.json
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
