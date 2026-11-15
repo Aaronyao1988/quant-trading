@@ -18,6 +18,7 @@ from typing import Any
 
 import ccxt
 import pandas as pd
+from dotenv import load_dotenv
 
 LOGGER = logging.getLogger("okx-demo-bot")
 
@@ -32,10 +33,14 @@ LEDGER_FILENAME = "virtual_ledger_200.json"
 # OKX spot BTC/USDT min notional is typically ~5 USDT; keep as floor fallback.
 DEFAULT_MIN_NOTIONAL_USDT = 5.0
 
+BOT_DIR = Path(__file__).resolve().parent
+# Load gitignored .env from the bot directory before any OKX_* reads.
+load_dotenv(BOT_DIR / ".env")
+
 
 def ledger_path() -> Path:
     """Persist ledger next to this script so cwd does not matter."""
-    return Path(__file__).resolve().parent / LEDGER_FILENAME
+    return BOT_DIR / LEDGER_FILENAME
 
 
 def load_ledger(initial_usdt: float = DEFAULT_INITIAL_USDT, path: Path | None = None) -> dict:

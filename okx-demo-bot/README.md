@@ -19,13 +19,15 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Export credentials (never commit these):
+3. Credentials (never commit secrets). Either export env vars:
 
 ```bash
 export OKX_API_KEY="your-demo-key"
 export OKX_API_SECRET="your-demo-secret"
 export OKX_API_PASSPHRASE="your-demo-passphrase"
 ```
+
+Or copy `.env.example` → `.env` and fill in the three values. `bot.py` calls `load_dotenv()` on the bot directory’s gitignored `.env` before reading `OKX_*` (handy for Mac/agent smoke without exporting vars in the shell).
 
 ## Run
 
