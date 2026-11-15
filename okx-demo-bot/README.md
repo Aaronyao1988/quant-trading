@@ -86,6 +86,18 @@ On first run the bot creates `virtual_ledger_200.json` next to `bot.py`:
 
 `last_traded_ts` is the closed-candle timestamp already traded so the bot does **at most one trade per closed 15m bar**. Delete the file to reset the $200 sim. Demo exchange balances are separate; the bot sizes from the ledger, not from OKX free balance.
 
+## V1–V4 90-day research benchmark (offline)
+
+Fee-aware offline matrix under `research/` (does **not** touch the live demo loop or `virtual_ledger_200.json`):
+
+```bash
+python -m research.run_benchmark           # fetch/cache public OHLCV + run V1–V4
+python -m research.run_benchmark --refresh # force re-fetch
+python -m pytest tests/ -q
+```
+
+Report: `reports/v1-v4-90d-benchmark.md`. OHLCV caches live in gitignored `data/`.
+
 ## Smoke check (no API keys)
 
 ```bash
