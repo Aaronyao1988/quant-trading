@@ -12,3 +12,9 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.pytest_cache/
+
+# Large research OHLCV / funding caches (regenerate via research.run_benchmark)
+data/*.csv
+data/cache_meta.json
+!data/.gitkeep
