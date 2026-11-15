@@ -51,6 +51,26 @@ python bot.py --loop --sleep 60
 
 Useful flags: `--allocation-pct 0.5`, `--fast 10`, `--slow 30`, `-v`.
 
+## SMA snapshot + historical replay
+
+Offline lookback defaults to **14 days** (≈ **1,344** closed 15m bars; OKX OHLCV is paginated). Public market data works without API keys; demo keys are only required for `--demo-orders`.
+
+```bash
+python replay.py
+python replay.py --days 7          # override lookback
+python replay.py --hours 48        # or hours
+python replay.py --md-out /tmp/replay-14d.md
+python replay.py --json-out /tmp/replay.json
+```
+
+Optional controlled demo BUY then SELL (updates `virtual_ledger_200.json`; backs up first). **Do not** enable in CI/cloud without demo keys — historical crosses are never sent as live orders.
+
+```bash
+python replay.py --demo-orders
+```
+
+`replay.py` reuses `compute_signal` / demo client helpers from `bot.py`. Historical fills are virtual at bar close. After the replay it classifies three market regimes (sustained uptrend / sustained downtrend / narrow-range oscillation) and lists which golden/death crosses fell in each.
+
 ## Ledger
 
 On first run the bot creates `virtual_ledger_200.json` next to `bot.py`:
