@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-11-16 — review fixes
+
+- Do not book cancelled, rejected, or expired orders whose `filled` is null. A missing size is not the requested quantity. Closed orders are booked only when `filled > 0`; an unclear payload is refreshed with `fetch_order` first.
+- A fee in a third currency is converted with the `CCY/USDT` ticker. If that price is missing, the reported position is recorded and the book is halted so a later bar cannot enter again.
+- `OrderNotFound` keeps `pending_order` and retries on later cycles and on startup for 30 minutes. After that, new entries halt and the client id is kept on `unresolved_order`.
+- `--once` uses the same 30 second freshness window as the loop. `--allow-stale` is the override.
+
 ## 2026-11-16
 
 Paper-only rebuild of `okx-demo-bot`. Sandbox mode stays mandatory. No live path.

@@ -76,14 +76,16 @@ Proceeds = quote notional − quote fee. If the exchange reports more base than 
 `--loop` does not sleep a fixed 60s.
 
 1. On startup, any `pending_order` is reconciled immediately, even mid-bar.
-2. `plan_wake` sleeps until the candle boundary plus `--buffer-sec` (default 2). A bar whose close is already older than `--act-window-sec` (default 30) is skipped: sending then would not be the next open. `--once` does not apply that window; it acts on the latest closed bar when the operator asks.
+2. `plan_wake` sleeps until the candle boundary plus `--buffer-sec` (default 2). A bar whose close is already older than `--act-window-sec` (default 30) is skipped, including `--once`. `--allow-stale` is the explicit override. Sending later than that window is not the next open.
 3. Candles are paged (`limit=100`) until `min_closed + 2` rows are in hand. The forming bar is dropped. If the just-closed open is missing, the fetch is retried a few times with a short sleep.
 4. One action per closed-bar timestamp. `last_attempt_ts` is set when an order is about to be sent, or when the order is rejected, or when size is below the minimum. A failure does not send again on that bar.
 5. The client order id (32 hex chars, OKX `clOrdId`) is written into `pending_order` and the ledger is replaced **before** `create_order`.
 6. Every order sends `tgtCcy=base_ccy`. See §6.
-7. Network errors leave `pending_order` in place. The next cycle, or the next startup, calls `fetch_order` with that client id. A missing id is retried three times, then the pending record is cleared and the bar stays skipped. Exchange rejects clear the pending record and still keep `last_attempt_ts`.
-8. Other exceptions in the loop are logged. Backoff is `min(300, 5 * 2^(n-1))` seconds. `LedgerError` and `KeyboardInterrupt` still stop the process.
-9. Halt: if `virtual_usdt + virtual_btc * mark < 0.80 * initial_usdt`, buys are skipped. Sells are not.
+7. A returned payload is booked only when status is `closed` or `filled` and `filled > 0`, or when a cancelled/rejected/expired order reports `filled > 0` (that partial size only). `filled is None` is never replaced with the requested quantity. An unclear payload is refreshed with `fetch_order` before any booking.
+8. Network errors and `OrderNotFound` leave `pending_order` in place. Later cycles and the next startup call `fetch_order` on that client id before they will send anything else. The search lasts 30 minutes from `since_ms`. After that the book sets `entries_halted` and stores `unresolved_order` so a late fill cannot be doubled by a new entry.
+9. A fee in a third currency (for example OKB) is converted with the `CCY/USDT` ticker and subtracted. If that ticker is missing, the reported base size is still recorded and `entries_halted` is set. The fee is not booked as zero, and a later bar cannot open a second position.
+10. Other exceptions in the loop are logged. Backoff is `min(300, 5 * 2^(n-1))` seconds. `LedgerError` and `KeyboardInterrupt` still stop the process.
+11. Halt: if `virtual_usdt + virtual_btc * mark < 0.80 * initial_usdt`, or `entries_halted` is set, buys are skipped. Sells are not.
 
 Mark price is the ticker last, or the last closed close if the ticker call fails. The signal itself does not use the ticker.
 
@@ -101,13 +103,13 @@ OKX spot market **buys** default `sz` to quote currency (`tgtCcy=quote_ccy`). Ma
 
 ## 7. Tests
 
-`python -m pytest` covers capped buys, quote and base fees (including not double-counting `fee` and `fees`), capped sells, residual dust, atomic replace, unparseable ledgers, reset, the JSONL append, EMA NaN warmup, SPEC SMA warmup, already-long / already-flat / halt decisions, next-open fills, fees on versus off, vol weight below 100%, the three-book replay, pagination to 240 bars, sandbox-header refusal, halt blocking a buy and allowing a sell, reconciliation that does not send a second order, a network error that does not retry the bar, and loop backoff.
+`python -m pytest` covers the ledger and replay cases plus execution regressions: a cancelled order with `filled` null does not spend the book, a partial cancel books only the reported size, `OrderNotFound` keeps the pending id until a later fill or the 30 minute halt, an OKB fee is converted or the book is halted with the position recorded, and `--once` skips a stale bar unless `--allow-stale` is set.
 
 `python -m unittest smoke_test.py` still checks SMA warmup, a 3/5 cross, and `extract_fill` fallbacks.
 
 ## 8. Limits
 
-- Demo balances and the virtual ledger still diverge if a fill is booked on the exchange and then rejected by `FillRejected`, or if `fetch_order` cannot see a just-accepted id after three tries. `unbooked_order` is set when a returned fill cannot be applied. Check the demo UI when that field is non-null.
+- If `fetch_order` still cannot see a client id after 30 minutes, new entries halt and the id stays on `unresolved_order`. A fill that shows up on a later startup is booked before any new order. Check the demo UI when `entries_halted` is set.
 - The assumption “`filled` is gross base and `fee` is not already removed” is what the tests lock in. If a future ccxt build reports net filled, BTC fees would be subtracted twice. The fill log stores both numbers so a bad print is visible.
 - Research numbers in `RESEARCH_SUMMARY.md` used Binance candles. This bot trades OKX demo prints.
 - SPEC v1 is a frozen paper rule, not evidence of a durable edge. Run it next to the other two books.

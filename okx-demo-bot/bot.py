@@ -183,11 +183,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="With --check-order-size, place a minimum demo buy and sell. Does not touch strategy ledgers.",
     )
     parser.add_argument("--buffer-sec", type=float, default=2.0, help="Seconds after the candle close.")
+    parser.add_argument("--act-window-sec", type=float, default=30.0, help="Skip a closed bar older than this many seconds.")
     parser.add_argument(
-        "--act-window-sec",
-        type=float,
-        default=30.0,
-        help="Skip a closed bar older than this; it is no longer the next open.",
+        "--allow-stale",
+        action="store_true",
+        help="Send on a closed bar older than --act-window-sec. Default is to skip it.",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
@@ -260,6 +260,8 @@ def main(argv: list[str] | None = None) -> int:
                 symbol=args.symbol,
                 dry_run=args.dry_run,
                 initial_usdt=args.initial_usdt,
+                act_window_sec=args.act_window_sec,
+                allow_stale=args.allow_stale,
             )
     except LedgerError as exc:
         LOGGER.error("%s", exc)

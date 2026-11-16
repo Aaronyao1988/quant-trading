@@ -30,11 +30,12 @@ cp .env.example .env   # fill OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE
 
 ## Run
 
-One cycle of SPEC v1 (creates a fresh $200 ledger the first time):
+One cycle of SPEC v1 (creates a fresh $200 ledger the first time). A closed bar older than 30 seconds is skipped; `--allow-stale` sends anyway:
 
 ```bash
 python bot.py --once
 python bot.py --once --dry-run          # signal and size only; no order
+python bot.py --once --allow-stale      # act even if the close is no longer fresh
 python bot.py --loop                    # sleep until each 4h close + 2s
 ```
 
@@ -67,7 +68,7 @@ Backups are named `ledger_<book>.backup.<epoch>.json`. An unreadable ledger abor
 
 ## Halt
 
-If marked equity (virtual USDT + virtual BTC × mark) is **below 80%** of that book's `initial_usdt`, new buys are skipped. Sells still run. The threshold is per ledger, so one book can halt while the others keep entering.
+If marked equity (virtual USDT + virtual BTC × mark) is **below 80%** of that book's `initial_usdt`, new buys are skipped. Sells still run. The same entry block is set when a fill's fee cannot be converted to USDT, or when a client order is still missing after 30 minutes. The position from a real fill stays on the ledger so the book cannot enter twice.
 
 ## Order size and `tgtCcy`
 

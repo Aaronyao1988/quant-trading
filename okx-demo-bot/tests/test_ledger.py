@@ -7,6 +7,7 @@ import json
 import pytest
 
 from ledger import (
+    FeeUnconverted,
     FillRejected,
     LedgerError,
     ParsedFill,
@@ -166,3 +167,47 @@ def test_commit_fill_appends_jsonl(tmp_path):
     assert len(lines) == 1
     assert json.loads(lines[0])["side"] == "buy"
     assert json.loads(path.read_text())["virtual_usdt"] == 150.0
+
+
+def test_cancelled_order_does_not_use_requested_quantity():
+    parsed = parse_ccxt_order(
+        {"id": "1", "status": "canceled", "filled": None, "cost": None},
+        fallback_amount=0.01,
+        fallback_price=50_000.0,
+    )
+    assert parsed.filled_base == 0.0
+    before = _state()
+    with pytest.raises(FillRejected):
+        apply_buy_fill(before, parsed, base="BTC", quote="USDT", mark_price=50_000.0)
+    assert before["virtual_usdt"] == 200.0
+    assert before["virtual_btc"] == 0.0
+
+
+def test_rejected_and_expired_null_fills_stay_zero():
+    for status in ("rejected", "expired", "cancelled"):
+        parsed = parse_ccxt_order(
+            {"status": status, "filled": None, "cost": None},
+            fallback_amount=1.0,
+            fallback_price=100.0,
+        )
+        assert parsed.filled_base == 0.0
+
+
+def test_partial_cancel_keeps_reported_size_only():
+    parsed = parse_ccxt_order(
+        {"status": "canceled", "filled": 0.004, "cost": 40.0, "average": 10_000.0},
+        fallback_amount=1.0,
+        fallback_price=10_000.0,
+    )
+    assert parsed.filled_base == pytest.approx(0.004)
+    new, _event = apply_buy_fill(_state(), parsed, base="BTC", quote="USDT")
+    assert new["virtual_btc"] == pytest.approx(0.004)
+    assert new["virtual_usdt"] == pytest.approx(160.0)
+
+
+def test_third_currency_fee_is_not_treated_as_zero():
+    parsed = ParsedFill(0.01, 100.0, 0.5, "OKB", 10_000.0, "closed", "1")
+    with pytest.raises(FeeUnconverted) as caught:
+        apply_buy_fill(_state(), parsed, base="BTC", quote="USDT")
+    assert caught.value.currency == "OKB"
+    assert caught.value.cost == pytest.approx(0.5)

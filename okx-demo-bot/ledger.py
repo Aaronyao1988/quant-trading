@@ -26,6 +26,18 @@ class FillRejected(Exception):
     """Fill cannot be booked. Balances are left unchanged."""
 
 
+class FeeUnconverted(Exception):
+    """Fee is in a currency this book cannot price. Do not treat it as zero."""
+
+    def __init__(self, currency: str, cost: float):
+        self.currency = currency
+        self.cost = cost
+        super().__init__(
+            f"Fee {cost} {currency} is not BTC or USDT and could not be converted. "
+            "It must not be booked as zero."
+        )
+
+
 @dataclass
 class ParsedFill:
     filled_base: float
@@ -61,6 +73,10 @@ def fresh_ledger(initial_usdt: float = INITIAL_USDT, strategy_id: str | None = N
         "last_attempt_ts": None,
         "pending_order": None,
         "unbooked_order": None,
+        "entries_halted": False,
+        "entries_halt_reason": None,
+        "unconverted_fee": None,
+        "unresolved_order": None,
     }
 
 
@@ -156,6 +172,10 @@ def load_ledger(
     state["pending_order"] = pending
     if "unbooked_order" not in state:
         state["unbooked_order"] = None
+    state["entries_halted"] = state.get("entries_halted") is True
+    state.setdefault("entries_halt_reason", None)
+    state.setdefault("unconverted_fee", None)
+    state.setdefault("unresolved_order", None)
     if strategy_id is not None:
         existing = state.get("strategy")
         if existing not in (None, strategy_id):
@@ -221,10 +241,18 @@ def _ccy(value: Any) -> str | None:
     return text.upper() if text else None
 
 
+# A cancelled or rejected order often has filled=None. That is zero, not the
+# size we asked for. Using the requested quantity here booked a phantom buy
+# of the entire cash balance.
+_NO_FILL_STATUSES = {"canceled", "cancelled", "rejected", "expired"}
+
+
 def parse_ccxt_order(
     order: dict[str, Any] | None,
     fallback_amount: float = 0.0,
     fallback_price: float = 0.0,
+    *,
+    allow_fallback: bool = True,
 ) -> ParsedFill:
     """Turn a ccxt order into base filled, quote notional, and fee.
 
@@ -232,14 +260,22 @@ def parse_ccxt_order(
     ``filled`` is treated as the gross base amount. A positive fee in the base
     currency is removed from the credited BTC; a quote fee is added to the
     USDT outlay (buys) or taken out of proceeds (sells).
+
+    Cancelled, rejected, and expired orders never use ``fallback_amount``.
+    Booking passes ``allow_fallback=False`` so a missing ``filled`` cannot
+    become the requested quantity.
     """
     if not isinstance(order, dict):
         raise FillRejected("Order payload is not an object")
+    status = str(order.get("status") or "").lower()
     filled = order.get("filled")
     cost = order.get("cost")
     average = order.get("average") if order.get("average") not in (None, "") else order.get("price")
     if filled is None:
-        filled_amt = float(fallback_amount)
+        if status in _NO_FILL_STATUSES or not allow_fallback:
+            filled_amt = 0.0
+        else:
+            filled_amt = float(fallback_amount)
     else:
         filled_amt = float(filled)
     if cost is not None:
@@ -286,9 +322,7 @@ def _split_fee(parsed: ParsedFill, base: str, quote: str) -> tuple[float, float]
         return parsed.fee_cost, 0.0
     if parsed.fee_currency == quote_u:
         return 0.0, parsed.fee_cost
-    raise FillRejected(
-        f"Fee currency {parsed.fee_currency} is neither {base_u} nor {quote_u}"
-    )
+    raise FeeUnconverted(parsed.fee_currency, parsed.fee_cost)
 
 
 def _equity(usdt: float, btc: float, mark: float | None) -> float | None:
