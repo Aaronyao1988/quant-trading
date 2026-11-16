@@ -2,6 +2,11 @@
 .env
 virtual_ledger_200.json
 virtual_ledger_200.backup.*.json
+ledger_*.json
+fills_*.jsonl
+*.backup.*.json
+*.backup.*.jsonl
+*.tmp.*
 replay_last_run.json
 replay_run.log
 loop_1h_mac.*

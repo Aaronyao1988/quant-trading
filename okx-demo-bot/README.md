@@ -1,96 +1,112 @@
-# OKX BTC/USDT Demo Bot
+# OKX BTC/USDT demo paper bot
 
-Paper (demo) spot bot for **BTC/USDT** on OKX using `ccxt`.
+Paper trading on the **OKX demo** (sandbox) account. The process refuses to run without `x-simulated-trading: 1`. There is no live-trading flag. `OKX_LIVE` in the environment aborts startup.
 
-- Strategy: SMA **10 / 30** crossover on **closed 15m** candles
-- Capital model: **virtual $200 USDT** sub-ledger (JSON); ledger is source of truth for size / PnL
-- Fills: real **OKX Demo Trading** market orders (`set_sandbox_mode(True)` → `x-simulated-trading: 1`)
-- Risk: ~**50%** of virtual USDT per entry (configurable); BUY only when flat; SELL exits full virtual BTC
+Three 4h paper books, each with its own ledger:
+
+| Book | Rule | Ledger |
+| --- | --- | --- |
+| `spec_v1` (default) | EMA 10 / SMA 230 cross, 15% vol target, cap 100% | `ledger_spec_v1.json` |
+| `ema_50_200` | EMA 50 / EMA 200 cross, 100% of cash | `ledger_ema_50_200.json` |
+| `buy_and_hold` | Buy 100% once and hold | `ledger_buy_and_hold.json` |
+
+`sma_10_30` is the old 15m SMA 10/30 book at 50% of cash. It is not the default.
+
+Signals use closed bars. A cross on bar *t* is sent once, just after that bar closes, which is the practical stand-in for the next open. The loop does not poll every 60 seconds.
 
 ## Setup
 
-1. On [OKX](https://www.okx.com/), open **Demo Trading** and create a **demo** API key (not live).
-2. Install deps:
+Create a **demo** API key (Trade permission). Do not use a live key.
 
 ```bash
 cd okx-demo-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env   # fill OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE
 ```
 
-3. Credentials (never commit secrets). Either export env vars:
-
-```bash
-export OKX_API_KEY="your-demo-key"
-export OKX_API_SECRET="your-demo-secret"
-export OKX_API_PASSPHRASE="your-demo-passphrase"
-```
-
-Or copy `.env.example` → `.env` and fill in the three values. `bot.py` calls `load_dotenv()` on the bot directory’s gitignored `.env` before reading `OKX_*` (handy for Mac/agent smoke without exporting vars in the shell).
+`.env` is gitignored. Never commit it.
 
 ## Run
 
-One cycle (default):
+One cycle of SPEC v1 (creates a fresh $200 ledger the first time). A closed bar older than 30 seconds is skipped; `--allow-stale` sends anyway:
 
 ```bash
 python bot.py --once
+python bot.py --once --dry-run          # signal and size only; no order
+python bot.py --once --allow-stale      # act even if the close is no longer fresh
+python bot.py --loop                    # sleep until each 4h close + 2s
 ```
 
-Signal / sizing only (still needs keys for market data + demo header check; no orders):
+All three 4h books in one process:
 
 ```bash
-python bot.py --once --dry-run
+python bot.py --all-books --once
+python bot.py --all-books --loop
 ```
 
-Loop every 60s:
+Legacy 15m book, on its own ledger:
 
 ```bash
-python bot.py --loop --sleep 60
+python bot.py --strategy sma_10_30 --loop
 ```
 
-Useful flags: `--allocation-pct 0.5`, `--fast 10`, `--slow 30`, `-v`.
+`--initial-usdt` applies when a ledger is created or reset. It does not rescale an existing book.
 
-## SMA snapshot + historical replay
+## Reset
 
-Offline lookback defaults to **14 days** (≈ **1,344** closed 15m bars; OKX OHLCV is paginated). Public market data works without API keys; demo keys are only required for `--demo-orders`.
+Rotate the current ledger and fill log aside and start again at $200:
+
+```bash
+python bot.py --reset-ledger                      # spec_v1 only
+python bot.py --all-books --reset-ledger          # the three 4h books
+python bot.py --reset-ledger --once               # reset, then run one cycle
+```
+
+Backups are named `ledger_<book>.backup.<epoch>.json`. An unreadable ledger aborts the process. Delete or reset it; the bot will not trade on a partial file.
+
+## Halt
+
+If marked equity (virtual USDT + virtual BTC × mark) is **below 80%** of that book's `initial_usdt`, new buys are skipped. Sells still run. The same entry block is set when a fill's fee cannot be converted to USDT, or when a client order is still missing after 30 minutes. The position from a real fill stays on the ledger so the book cannot enter twice.
+
+## Order size and `tgtCcy`
+
+OKX spot market buys are ambiguous: without `tgtCcy`, `sz` is quote USDT for a buy and base BTC for a sell. This bot always sends `tgtCcy=base_ccy` plus a client order id that is saved **before** the request. Confirm that on the demo account before trusting size:
+
+```bash
+python bot.py --check-order-size                         # print the order, send nothing
+python bot.py --check-order-size --send-demo-check       # minimum demo buy, then sell
+```
+
+The send path does not write a strategy ledger. Read the printed filled base versus the requested BTC quantity. A match means the amount was treated as BTC.
+
+## Replay
+
+Public 4h candles, no keys, no orders. Next-bar open, 0.10% fee, 0.05% slippage, SPEC vol weight, three books side by side. Warmup for SMA 230 is fetched on top of `--days`.
 
 ```bash
 python replay.py
-python replay.py --days 7          # override lookback
-python replay.py --hours 48        # or hours
-python replay.py --md-out /tmp/replay-14d.md
-python replay.py --json-out /tmp/replay.json
+python replay.py --days 180
+python replay.py --csv candles.csv --json-out /tmp/replay.json
 ```
 
-Optional controlled demo BUY then SELL (updates `virtual_ledger_200.json`; backs up first). **Do not** enable in CI/cloud without demo keys — historical crosses are never sent as live orders.
+## Tests
 
 ```bash
-python replay.py --demo-orders
+python -m pytest
+python -m unittest smoke_test.py
 ```
 
-`replay.py` reuses `compute_signal` / demo client helpers from `bot.py`. Historical fills are virtual at bar close. After the replay it classifies three market regimes (sustained uptrend / sustained downtrend / narrow-range oscillation) and lists which golden/death crosses fell in each.
+## Files
 
-## Ledger
+| File | Role |
+| --- | --- |
+| `bot.py` | CLI, sandbox client, order-size check |
+| `execution.py` | Close-aligned loop, one order per bar, reconciliation |
+| `strategy.py` | SPEC v1, EMA 50/200, buy-and-hold, legacy SMA |
+| `ledger.py` | Atomic JSON ledger, fill rules, JSONL log |
+| `replay.py` | Offline next-open replay |
+| `fills_<book>.jsonl` | Append-only fill log (gitignored) |
 
-On first run the bot creates `virtual_ledger_200.json` next to `bot.py`:
-
-```json
-{
-  "initial_usdt": 200.0,
-  "virtual_usdt": 200.0,
-  "virtual_btc": 0.0,
-  "last_traded_ts": null
-}
-```
-
-`last_traded_ts` is the closed-candle timestamp already traded so the bot does **at most one trade per closed 15m bar**. Delete the file to reset the $200 sim. Demo exchange balances are separate; the bot sizes from the ledger, not from OKX free balance.
-
-## Smoke check (no API keys)
-
-```bash
-python -c "from bot import compute_signal, load_ledger; import pandas as pd; print('import ok')"
-python -m py_compile bot.py
-```
-
-Live smoke against OKX demo requires the three env vars above.
+More detail is in `docs/TECHNICAL.md`. The research that chose these books is in `docs/RESEARCH_SUMMARY.md`.
