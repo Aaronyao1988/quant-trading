@@ -1,86 +1,55 @@
 #!/usr/bin/env python3
-"""OKX BTC/USDT spot demo bot: SMA 10/30 crossover on 15m candles.
+"""OKX BTC/USDT demo paper bot.
 
-Virtual $200 USDT sub-ledger is the source of truth for sizing / PnL.
-Orders still go to OKX demo trading (paper fills via x-simulated-trading).
+Sandbox only. ``set_sandbox_mode(True)`` is mandatory and a missing
+``x-simulated-trading: 1`` header aborts before any order. There is no live
+path. Three paper books (SPEC v1, EMA 50/200, buy-and-hold) keep separate
+ledgers. The legacy 15m SMA 10/30 book is available and is not the default.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import sys
-import time
-from pathlib import Path
-from typing import Any
 
 import ccxt
-import pandas as pd
 from dotenv import load_dotenv
 
+from execution import (
+    SYMBOL,
+    assert_sandbox,
+    execute_cycle,
+    market_limits,
+    new_client_id,
+    run_loop,
+    spot_market_order_params,
+)
+from ledger import BOT_DIR, INITIAL_USDT, LedgerError, ledger_path, reset_ledger
+from strategy import PAPER_BOOKS, STRATEGIES
+
 LOGGER = logging.getLogger("okx-demo-bot")
-
-DEFAULT_SYMBOL = "BTC/USDT"
-DEFAULT_TIMEFRAME = "15m"
-DEFAULT_FAST = 10
-DEFAULT_SLOW = 30
-DEFAULT_ALLOCATION_PCT = 0.50
-DEFAULT_INITIAL_USDT = 200.0
-DEFAULT_SLEEP_SEC = 60
-LEDGER_FILENAME = "virtual_ledger_200.json"
-# OKX spot BTC/USDT min notional is typically ~5 USDT; keep as floor fallback.
-DEFAULT_MIN_NOTIONAL_USDT = 5.0
-
-BOT_DIR = Path(__file__).resolve().parent
-# Load gitignored .env from the bot directory before any OKX_* reads.
-load_dotenv(BOT_DIR / ".env")
-
-
-def ledger_path() -> Path:
-    """Persist ledger next to this script so cwd does not matter."""
-    return BOT_DIR / LEDGER_FILENAME
-
-
-def load_ledger(initial_usdt: float = DEFAULT_INITIAL_USDT, path: Path | None = None) -> dict:
-    """Load persisted virtual sub-ledger or initialize a new one."""
-    path = path or ledger_path()
-    if path.exists():
-        state = json.loads(path.read_text())
-        for key in ("initial_usdt", "virtual_usdt", "virtual_btc", "last_traded_ts"):
-            if key not in state:
-                raise ValueError(f"Ledger missing required key: {key}")
-        return state
-
-    state = {
-        "initial_usdt": float(initial_usdt),
-        "virtual_usdt": float(initial_usdt),
-        "virtual_btc": 0.0,
-        "last_traded_ts": None,
-    }
-    save_ledger(state, path=path)
-    return state
-
-
-def save_ledger(state: dict, path: Path | None = None) -> None:
-    path = path or ledger_path()
-    path.write_text(json.dumps(state, indent=2) + "\n")
 
 
 def require_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
         raise SystemExit(
-            f"Missing required env var {name}. "
-            "Create OKX Demo Trading API keys and export "
-            "OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE."
+            f"Missing {name}. Export demo OKX_API_KEY, OKX_API_SECRET, and "
+            "OKX_API_PASSPHRASE, or put them in okx-demo-bot/.env (never commit it)."
         )
     return value
 
 
 def create_okx_demo_exchange() -> ccxt.okx:
-    """Build a ccxt OKX client locked to demo/sandbox trading."""
+    """Build a ccxt client locked to OKX demo trading.
+
+    ``OKX_LIVE`` is refused so a copied shell export cannot point this process
+    at real funds. The sandbox header is checked again before every cycle.
+    """
+    if os.environ.get("OKX_LIVE", "").strip().lower() in {"1", "true", "yes"}:
+        raise SystemExit("OKX_LIVE is set. This bot refuses live trading.")
     exchange = ccxt.okx(
         {
             "apiKey": require_env("OKX_API_KEY"),
@@ -89,335 +58,138 @@ def create_okx_demo_exchange() -> ccxt.okx:
             "enableRateLimit": True,
             "options": {
                 "defaultType": "spot",
+                # See spot_market_order_params: we also pass tgtCcy on each order.
+                "tgtCcy": "base_ccy",
             },
         }
     )
-    # Critical: attaches x-simulated-trading: 1 so requests stay on demo paper funds.
     exchange.set_sandbox_mode(True)
-    header = exchange.headers.get("x-simulated-trading")
-    if str(header) != "1":
-        raise RuntimeError(
-            "OKX demo header missing after set_sandbox_mode(True); "
-            f"got x-simulated-trading={header!r}. Refusing to trade."
-        )
+    assert_sandbox(exchange)
     return exchange
 
 
-def fetch_closed_candles(
-    exchange: ccxt.Exchange,
-    symbol: str,
-    timeframe: str,
-    slow: int,
-) -> pd.DataFrame:
-    """Fetch OHLCV and drop the still-forming candle."""
-    limit = max(slow + 10, 50)
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    if not ohlcv or len(ohlcv) < slow + 2:
-        raise RuntimeError(
-            f"Not enough candles for SMA({slow}): got {0 if not ohlcv else len(ohlcv)}"
-        )
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    # Last row is the in-progress candle; strategy uses only closed bars.
-    return df.iloc[:-1].copy().reset_index(drop=True)
+def _selected_specs(args: argparse.Namespace) -> list:
+    if args.all_books and args.strategy:
+        raise SystemExit("Pass either --all-books or --strategy, not both.")
+    if args.all_books:
+        return [STRATEGIES[name] for name in PAPER_BOOKS]
+    name = args.strategy or "spec_v1"
+    return [STRATEGIES[name]]
 
 
-def compute_signal(
-    df: pd.DataFrame,
-    fast: int = DEFAULT_FAST,
-    slow: int = DEFAULT_SLOW,
-) -> str:
-    """SMA crossover on the two most recent *closed* candles.
+def check_order_size(exchange: ccxt.okx, symbol: str, send: bool) -> int:
+    """Print the market-buy size we would send, and optionally do a min demo round trip.
 
-    Returns BUY / SELL / HOLD. HOLD when SMAs are still NaN (warmup).
+    This does not touch a strategy ledger. It exists because OKX spot market
+    buys are ambiguous between base BTC and quote USDT (``tgtCcy``).
     """
-    if len(df) < slow + 1:
-        return "HOLD"
-
-    work = df.copy()
-    work["sma_fast"] = work["close"].rolling(fast).mean()
-    work["sma_slow"] = work["close"].rolling(slow).mean()
-
-    prev, last_closed = work.iloc[-2], work.iloc[-1]
-    values = [
-        prev["sma_fast"],
-        prev["sma_slow"],
-        last_closed["sma_fast"],
-        last_closed["sma_slow"],
-    ]
-    if any(pd.isna(v) for v in values):
-        return "HOLD"
-
-    if prev["sma_fast"] <= prev["sma_slow"] and last_closed["sma_fast"] > last_closed["sma_slow"]:
-        return "BUY"
-    if prev["sma_fast"] >= prev["sma_slow"] and last_closed["sma_fast"] < last_closed["sma_slow"]:
-        return "SELL"
-    return "HOLD"
-
-
-def min_amount(market: dict) -> float:
-    limits = (market.get("limits") or {}).get("amount") or {}
-    raw = limits.get("min")
-    return float(raw) if raw is not None else 0.00001
-
-
-def min_notional(market: dict) -> float:
-    limits = (market.get("limits") or {}).get("cost") or {}
-    raw = limits.get("min")
-    if raw is not None:
-        return float(raw)
-    return DEFAULT_MIN_NOTIONAL_USDT
-
-
-def extract_fill(order: dict, fallback_amount: float, fallback_price: float) -> tuple[float, float]:
-    """Prefer exchange-reported filled amount and cost over estimates.
-
-    Missing ``filled``/``cost`` fall back to requested size × mark price.
-    An explicit zero fill stays zero (do not invent a fill).
-    """
-    filled = order.get("filled")
-    cost = order.get("cost")
-    average = order.get("average") or order.get("price")
-
-    if filled is None:
-        filled_amt = float(fallback_amount)
-    else:
-        filled_amt = float(filled)
-
-    if cost is not None:
-        filled_cost = float(cost)
-    elif average is not None and filled_amt:
-        filled_cost = filled_amt * float(average)
-    else:
-        filled_cost = filled_amt * float(fallback_price)
-    return filled_amt, filled_cost
-
-
-def ensure_order_fill(
-    exchange: ccxt.Exchange,
-    symbol: str,
-    order: dict,
-    fallback_amount: float,
-    fallback_price: float,
-) -> tuple[float, float]:
-    """Refresh the order once if fill fields are missing (incomplete response)."""
-    needs_refresh = order.get("filled") is None or order.get("cost") is None
-    order_id = order.get("id")
-    if needs_refresh and order_id:
-        try:
-            order = exchange.fetch_order(order_id, symbol)
-            LOGGER.info(
-                "Refreshed order %s: filled=%s cost=%s",
-                order_id,
-                order.get("filled"),
-                order.get("cost"),
-            )
-        except ccxt.BaseError as exc:
-            LOGGER.warning("Could not refresh order %s: %s; using available fields", order_id, exc)
-    return extract_fill(order, fallback_amount, fallback_price)
-
-
-def print_status(state: dict, mark_price: float, signal: str, last_closed_ts: int) -> None:
-    equity = state["virtual_usdt"] + state["virtual_btc"] * mark_price
-    pnl_pct = ((equity / state["initial_usdt"]) - 1.0) * 100.0
-    LOGGER.info(
-        "ts=%s price=%.2f signal=%s | virtual=%.4f USDT + %.8f BTC | equity=$%.2f (%+.2f%%) | last_traded_ts=%s",
-        last_closed_ts,
-        mark_price,
-        signal,
-        state["virtual_usdt"],
-        state["virtual_btc"],
-        equity,
-        pnl_pct,
-        state.get("last_traded_ts"),
+    assert_sandbox(exchange)
+    exchange.load_markets()
+    if symbol not in exchange.markets:
+        LOGGER.error("Symbol %s is not on this OKX market list.", symbol)
+        return 1
+    min_amount, min_cost = market_limits(exchange, symbol)
+    ticker = exchange.fetch_ticker(symbol)
+    mark = float(ticker.get("last") or ticker.get("close") or 0.0)
+    if mark <= 0:
+        LOGGER.error("No ticker price; cannot size the check order.")
+        return 1
+    spend = max(min_cost * 1.05, min_cost + 1.0)
+    qty = float(exchange.amount_to_precision(symbol, max(spend / mark, min_amount)))
+    if qty * mark < min_cost:
+        qty = float(exchange.amount_to_precision(symbol, (min_cost * 1.05) / mark))
+    coid = new_client_id()
+    params = spot_market_order_params(coid)
+    print("OKX spot market-buy size check (demo sandbox only)")
+    print(f"  ccxt {ccxt.__version__}  options.tgtCcy={exchange.options.get('tgtCcy')!r}")
+    print(f"  symbol {symbol}  mark {mark:.2f}  min amount {min_amount}  min cost {min_cost}")
+    print(f"  requested base qty {qty:.8f}  estimated quote {qty * mark:.4f} USDT")
+    print(f"  create_order params {params}")
+    print(
+        "  Reading: amount is BTC because tgtCcy=base_ccy. "
+        "If the venue treated it as USDT, a fill would not match this base qty."
     )
-
-
-def execute_cycle(
-    exchange: ccxt.Exchange,
-    *,
-    symbol: str = DEFAULT_SYMBOL,
-    timeframe: str = DEFAULT_TIMEFRAME,
-    fast: int = DEFAULT_FAST,
-    slow: int = DEFAULT_SLOW,
-    allocation_pct: float = DEFAULT_ALLOCATION_PCT,
-    dry_run: bool = False,
-) -> dict:
-    """One strategy cycle: fetch candles, signal, optionally place demo order."""
-    state = load_ledger()
-    closed = fetch_closed_candles(exchange, symbol, timeframe, slow)
-    last_closed_ts = int(closed.iloc[-1]["ts"])
-    mark_price = float(closed.iloc[-1]["close"])
-
-    # Prefer live ticker for sizing mark if available; fall back to last close.
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-        if ticker.get("last"):
-            mark_price = float(ticker["last"])
-    except ccxt.BaseError as exc:
-        LOGGER.warning("fetch_ticker failed (%s); using last closed close", exc)
-
-    signal = compute_signal(closed, fast=fast, slow=slow)
-    print_status(state, mark_price, signal, last_closed_ts)
-
-    if state.get("last_traded_ts") == last_closed_ts:
-        LOGGER.info("Already acted on closed candle %s; skipping (idempotent).", last_closed_ts)
-        return state
-
-    market = exchange.market(symbol)
-    amt_min = min_amount(market)
-    cost_min = min_notional(market)
-    flat = state["virtual_btc"] < amt_min
-
-    if signal == "BUY":
-        if not flat:
-            LOGGER.info("BUY signal ignored: already long (virtual_btc=%.8f).", state["virtual_btc"])
-            return state
-
-        spend_usdt = state["virtual_usdt"] * allocation_pct
-        if spend_usdt < cost_min:
-            LOGGER.warning(
-                "BUY skipped: allocation %.4f USDT below min notional %.4f.",
-                spend_usdt,
-                cost_min,
-            )
-            return state
-
-        raw_qty = spend_usdt / mark_price
-        btc_qty = float(exchange.amount_to_precision(symbol, raw_qty))
-        if btc_qty < amt_min:
-            LOGGER.warning(
-                "BUY skipped: qty %s below min amount %s.",
-                btc_qty,
-                amt_min,
-            )
-            return state
-
-        estimated_cost = btc_qty * mark_price
-        if estimated_cost < cost_min:
-            LOGGER.warning(
-                "BUY skipped: estimated cost %.4f below min notional %.4f.",
-                estimated_cost,
-                cost_min,
-            )
-            return state
-
-        if dry_run:
-            LOGGER.info("DRY-RUN BUY %s BTC (~%.2f USDT) — no order sent.", btc_qty, estimated_cost)
-            return state
-
-        try:
-            order = exchange.create_market_buy_order(symbol, btc_qty)
-            filled_btc, spent_usdt = ensure_order_fill(
-                exchange, symbol, order, btc_qty, mark_price
-            )
-            if filled_btc <= 0:
-                LOGGER.error("BUY returned zero fill; leaving ledger unchanged.")
-                return state
-
-            # Cap spend to available virtual USDT so ledger cannot go deeply negative
-            # if demo fill cost exceeds our simulated budget (exchange has its own balance).
-            spent_usdt = min(spent_usdt, state["virtual_usdt"])
-            state["virtual_usdt"] = round(state["virtual_usdt"] - spent_usdt, 6)
-            state["virtual_btc"] = round(state["virtual_btc"] + filled_btc, 8)
-            state["last_traded_ts"] = last_closed_ts
-            save_ledger(state)
-            LOGGER.info("DEMO BUY filled: +%.8f BTC for -%.4f USDT", filled_btc, spent_usdt)
-        except ccxt.InsufficientFunds as exc:
-            LOGGER.error("BUY failed: insufficient demo funds on OKX: %s", exc)
-        except ccxt.InvalidOrder as exc:
-            LOGGER.error("BUY failed: invalid order (min size/notional?): %s", exc)
-        except ccxt.BaseError as exc:
-            LOGGER.error("BUY failed: %s", exc)
-        return state
-
-    if signal == "SELL":
-        if flat:
-            LOGGER.info("SELL signal ignored: flat.")
-            return state
-
-        btc_qty = float(exchange.amount_to_precision(symbol, state["virtual_btc"]))
-        if btc_qty < amt_min:
-            LOGGER.warning("SELL skipped: position %.8f below min amount %s.", btc_qty, amt_min)
-            return state
-
-        if dry_run:
-            LOGGER.info("DRY-RUN SELL %.8f BTC — no order sent.", btc_qty)
-            return state
-
-        try:
-            order = exchange.create_market_sell_order(symbol, btc_qty)
-            sold_btc, received_usdt = ensure_order_fill(
-                exchange, symbol, order, btc_qty, mark_price
-            )
-            if sold_btc <= 0:
-                LOGGER.error("SELL returned zero fill; leaving ledger unchanged.")
-                return state
-
-            # Incomplete fills: only reduce by what actually sold.
-            remaining = max(0.0, state["virtual_btc"] - sold_btc)
-            state["virtual_btc"] = round(remaining if remaining >= amt_min else 0.0, 8)
-            state["virtual_usdt"] = round(state["virtual_usdt"] + received_usdt, 6)
-            state["last_traded_ts"] = last_closed_ts
-            save_ledger(state)
-            LOGGER.info("DEMO SELL filled: -%.8f BTC for +%.4f USDT", sold_btc, received_usdt)
-            if remaining >= amt_min:
-                LOGGER.warning(
-                    "Partial sell: %.8f BTC still on virtual ledger (incomplete fill).",
-                    remaining,
-                )
-        except ccxt.InsufficientFunds as exc:
-            LOGGER.error("SELL failed: insufficient demo BTC on OKX: %s", exc)
-        except ccxt.InvalidOrder as exc:
-            LOGGER.error("SELL failed: invalid order: %s", exc)
-        except ccxt.BaseError as exc:
-            LOGGER.error("SELL failed: %s", exc)
-        return state
-
-    LOGGER.info("HOLD — no trade.")
-    return state
+    if not send:
+        print("  Dry run. Nothing sent. Add --send-demo-check to buy and sell this minimum on demo.")
+        return 0
+    LOGGER.warning("Sending a minimum demo buy then sell. Strategy ledgers are not updated.")
+    order = exchange.create_order(symbol, "market", "buy", qty, None, params)
+    filled = float(order.get("filled") or 0.0)
+    cost = float(order.get("cost") or 0.0)
+    if order.get("filled") is None or order.get("cost") is None:
+        refreshed = exchange.fetch_order(order.get("id") or coid, symbol, {"clientOrderId": coid})
+        filled = float(refreshed.get("filled") or 0.0)
+        cost = float(refreshed.get("cost") or 0.0)
+        order = refreshed
+    implied = (cost / filled) if filled else None
+    print(f"  buy id={order.get('id')} filled_base={filled:.8f} cost_quote={cost:.4f} implied={implied}")
+    if filled <= 0:
+        print("  INCONCLUSIVE: zero fill. No sell sent.")
+        return 1
+    rel = abs(filled - qty) / qty
+    if rel < 0.25 and implied and implied > 1000:
+        print("  OK: filled base is close to the requested BTC qty. tgtCcy=base_ccy took effect.")
+    elif filled > qty * 10:
+        print(
+            "  WARNING: filled base is far above the requested BTC qty. "
+            "The venue may have read the amount as quote USDT."
+        )
+    else:
+        print("  INCONCLUSIVE: compare filled base, quote cost, and implied price before trusting size.")
+    sell_qty = float(exchange.amount_to_precision(symbol, filled))
+    sell = exchange.create_order(
+        symbol, "market", "sell", sell_qty, None, spot_market_order_params(new_client_id())
+    )
+    print(
+        f"  sell id={sell.get('id')} filled_base={sell.get('filled')} "
+        f"proceeds={sell.get('cost')} (demo account round trip, ledger untouched)"
+    )
+    return 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="OKX BTC/USDT spot demo bot (SMA 10/30 on 15m, $200 virtual ledger)."
+        description="OKX BTC/USDT demo paper bot (sandbox only, separate ledgers per book)."
+    )
+    parser.add_argument("--once", action="store_true", help="Run one cycle and exit (default).")
+    parser.add_argument("--loop", action="store_true", help="Wait for each candle close, then run once.")
+    parser.add_argument(
+        "--strategy",
+        choices=sorted(STRATEGIES),
+        default=None,
+        help="Paper book (default spec_v1). sma_10_30 is the legacy 15m book.",
     )
     parser.add_argument(
-        "--once",
+        "--all-books",
         action="store_true",
-        help="Run a single cycle and exit (default unless --loop).",
+        help="Run spec_v1, ema_50_200, and buy_and_hold as three ledgers.",
     )
     parser.add_argument(
-        "--loop",
+        "--reset-ledger",
         action="store_true",
-        help="Poll forever, sleeping between cycles.",
+        help="Rotate the selected ledger(s) aside and start from a fresh $200 book.",
+    )
+    parser.add_argument("--initial-usdt", type=float, default=INITIAL_USDT)
+    parser.add_argument("--symbol", default=SYMBOL)
+    parser.add_argument("--dry-run", action="store_true", help="Size and log, but do not send orders.")
+    parser.add_argument(
+        "--check-order-size",
+        action="store_true",
+        help="Print the demo market-buy size and tgtCcy=base_ccy. Does not send unless --send-demo-check.",
     )
     parser.add_argument(
-        "--sleep",
-        type=int,
-        default=DEFAULT_SLEEP_SEC,
-        help=f"Seconds between loop cycles (default {DEFAULT_SLEEP_SEC}).",
+        "--send-demo-check",
+        action="store_true",
+        help="With --check-order-size, place a minimum demo buy and sell. Does not touch strategy ledgers.",
     )
-    parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
-    parser.add_argument("--timeframe", default=DEFAULT_TIMEFRAME)
-    parser.add_argument("--fast", type=int, default=DEFAULT_FAST)
-    parser.add_argument("--slow", type=int, default=DEFAULT_SLOW)
+    parser.add_argument("--buffer-sec", type=float, default=2.0, help="Seconds after the candle close.")
     parser.add_argument(
-        "--allocation-pct",
+        "--act-window-sec",
         type=float,
-        default=DEFAULT_ALLOCATION_PCT,
-        help="Fraction of virtual USDT to deploy per BUY (default 0.50).",
+        default=30.0,
+        help="Skip a closed bar older than this; it is no longer the next open.",
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Compute signal and size orders but do not place them.",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Debug logging.",
-    )
+    parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -427,54 +199,73 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-
-    if not 0 < args.allocation_pct <= 1:
-        LOGGER.error("--allocation-pct must be in (0, 1].")
-        return 2
-    if args.fast < 1 or args.slow <= args.fast:
-        LOGGER.error("--slow must be greater than --fast, and both >= 1.")
-        return 2
-
+    load_dotenv(BOT_DIR / ".env")
+    LOGGER.warning("PAPER ONLY. OKX demo sandbox is required. Live trading is disabled.")
     try:
-        exchange = create_okx_demo_exchange()
-        LOGGER.info(
-            "OKX demo mode ON (x-simulated-trading=%s).",
-            exchange.headers.get("x-simulated-trading"),
-        )
-        exchange.load_markets()
-        if args.symbol not in exchange.markets:
-            LOGGER.error("Symbol %s not found on OKX spot markets.", args.symbol)
-            return 1
+        specs = _selected_specs(args)
     except SystemExit:
         raise
-    except Exception as exc:  # noqa: BLE001 — top-level startup errors
-        LOGGER.error("Failed to initialize OKX client: %s", exc)
-        return 1
-
-    cycle_kwargs: dict[str, Any] = {
-        "symbol": args.symbol,
-        "timeframe": args.timeframe,
-        "fast": args.fast,
-        "slow": args.slow,
-        "allocation_pct": args.allocation_pct,
-        "dry_run": args.dry_run,
-    }
-
+    if args.once and args.loop:
+        LOGGER.error("Pass either --once or --loop.")
+        return 2
+    if args.initial_usdt <= 0:
+        LOGGER.error("--initial-usdt must be positive.")
+        return 2
+    if args.reset_ledger:
+        for spec in specs:
+            path = ledger_path(spec.id)
+            state = reset_ledger(path, initial_usdt=args.initial_usdt, strategy_id=spec.id)
+            LOGGER.info(
+                "Reset %s to %.2f USDT (%s).",
+                spec.id,
+                state["virtual_usdt"],
+                path.name,
+            )
+        if not (args.once or args.loop or args.check_order_size or args.send_demo_check):
+            return 0
+    if args.check_order_size or args.send_demo_check:
+        try:
+            exchange = create_okx_demo_exchange()
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("Failed to initialize OKX demo client: %s", exc)
+            return 1
+        return check_order_size(exchange, args.symbol, send=args.send_demo_check)
     try:
+        exchange = create_okx_demo_exchange()
+        exchange.load_markets()
+        if args.symbol not in exchange.markets:
+            LOGGER.error("Symbol %s is not on this OKX market list.", args.symbol)
+            return 1
+        LOGGER.info(
+            "Sandbox on (x-simulated-trading=%s). Books: %s.",
+            exchange.headers.get("x-simulated-trading"),
+            ", ".join(spec.id for spec in specs),
+        )
         if args.loop:
-            LOGGER.info("Entering loop (sleep=%ss). Ctrl+C to stop.", args.sleep)
-            while True:
-                try:
-                    execute_cycle(exchange, **cycle_kwargs)
-                except ccxt.NetworkError as exc:
-                    LOGGER.warning("Network error this cycle: %s", exc)
-                except ccxt.ExchangeError as exc:
-                    LOGGER.error("Exchange error this cycle: %s", exc)
-                time.sleep(max(1, args.sleep))
-        else:
-            execute_cycle(exchange, **cycle_kwargs)
+            return run_loop(
+                exchange,
+                specs,
+                symbol=args.symbol,
+                dry_run=args.dry_run,
+                buffer_sec=args.buffer_sec,
+                act_window_sec=args.act_window_sec,
+                initial_usdt=args.initial_usdt,
+            )
+        for spec in specs:
+            execute_cycle(
+                exchange,
+                spec,
+                symbol=args.symbol,
+                dry_run=args.dry_run,
+                initial_usdt=args.initial_usdt,
+            )
+    except LedgerError as exc:
+        LOGGER.error("%s", exc)
+        return 2
     except KeyboardInterrupt:
-        LOGGER.info("Stopped by user.")
+        LOGGER.info("Stopped.")
         return 0
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Fatal error: %s", exc)

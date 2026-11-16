@@ -1,0 +1,114 @@
+# OKX demo paper bot — technical notes
+
+Paper / sandbox only. Branch work that replaced the 15m SMA loop with separate ledgers, a close-aligned execution cycle, and the three 4h books from the 2026-11-16 research. Live trading is not implemented: `create_okx_demo_exchange` calls `set_sandbox_mode(True)`, refuses `OKX_LIVE`, and `assert_sandbox` rejects any client whose `x-simulated-trading` header is not `1`.
+
+## 1. Process
+
+One Python process, one ccxt OKX demo client.
+
+```
+bot.py            CLI, credentials, sandbox client, --check-order-size
+execution.py      sleep until candle close, one order per closed bar
+strategy.py       indicators and signals (closed bars only)
+ledger.py         virtual cash / BTC, atomic save, JSONL fills
+replay.py         same rules offline, no orders
+```
+
+Each book has `ledger_<id>.json` and `fills_<id>.jsonl` next to the code. The legacy file `virtual_ledger_200.json` is no longer read.
+
+Default book is `spec_v1`. `--all-books` runs `spec_v1`, `ema_50_200`, and `buy_and_hold`. Those three share the 4h clock. `sma_10_30` is 15m and stays on its own loop.
+
+## 2. Strategies
+
+Signals are computed on closed candles. The in-progress bar is dropped (`ts + timeframe > now`).
+
+**Cross.** Golden cross: previous fast ≤ previous slow and fast > slow, all four values finite. Death cross is the mirror. Same definition the old `compute_signal` used.
+
+**EMA.** `ewm(span, adjust=False)`, then the first `span - 1` outputs set to NaN. EMA(10) is first valid on the 10th close.
+
+**SMA.** Rolling mean, undefined until `window` closes exist. SMA(230) needs 231 closed bars before a cross can fire (current bar plus the previous bar).
+
+**ATR.** Wilder ATR(14). True range uses the previous close. The seed is the SMA of the first 14 true ranges after bar 0, so the first finite value is at index 14. The research grid used pandas `ewm(alpha=1/14)` instead. The two match long before the first SMA(230) cross; they are not bit-identical on the first few dozen bars.
+
+**SPEC v1 weight**, on the signal bar only:
+
+```
+sigma = (ATR(14) / close) * sqrt(bars_per_year)
+w     = min(1, 0.15 / sigma)
+```
+
+For 4h, `bars_per_year` is `365.25 * 6`. Missing or non-positive sigma skips that entry. Spend is `virtual_usdt * w` at the fill. No adds while in the trade. No leverage. A cross while already long is ignored; a death cross while flat is ignored.
+
+**EMA 50/200** uses the same cross and spends 100% of virtual USDT.
+
+**Buy-and-hold** buys 100% once and never emits a sell. The halt rule can block that first buy. It does not force an exit.
+
+**Legacy SMA 10/30** spends 50% of virtual USDT on 15m bars.
+
+`entry_weight` returns `None` when vol is undefined. The cycle records `last_attempt_ts` and does not retry that bar.
+
+## 3. Ledger
+
+Required fields: `initial_usdt`, `virtual_usdt`, `virtual_btc`, `last_traded_ts`. Optional: `last_attempt_ts`, `pending_order`, `unbooked_order`, `strategy`.
+
+`load_ledger` raises `LedgerError` on invalid JSON, a non-object, missing fields, or a negative balance. The CLI turns that into exit code 2. `--reset-ledger` moves the JSON and the JSONL aside (`*.backup.<epoch>.*`) and writes a new $200 book (or `--initial-usdt`).
+
+Saves go to `name.tmp.<pid>` in the same directory and then `os.replace`. A failed replace deletes the temp file and leaves the previous ledger.
+
+### Buys
+
+ccxt `filled` is treated as gross base. ccxt `cost` is quote notional and does **not** include the fee. The fee is read from `order["fee"]` (the `fees` list is used only when `fee` is absent, so the same fee is not applied twice).
+
+- Base fee (BTC): credited BTC = filled − fee.
+- Quote fee (USDT): USDT outlay = cost + fee.
+- A positive fee with no currency is rejected and not booked.
+- If the outlay is greater than `virtual_usdt`, credited BTC is multiplied by `virtual_usdt / outlay` and cash goes to zero. The old code capped cash and still credited the full BTC.
+- A zero fill, a fee that consumes the whole base fill, or a non-finite number leaves balances unchanged.
+
+### Sells
+
+Proceeds = quote notional − quote fee. If the exchange reports more base than the ledger holds, proceeds are multiplied by `held / filled` and the ledger BTC goes to zero. A smaller fill leaves the residual BTC in the ledger. Dust is not deleted.
+
+`commit_fill` replaces the JSON first, then appends one JSON line to the fill log (`O_APPEND`, one write).
+
+## 4. Execution
+
+`--loop` does not sleep a fixed 60s.
+
+1. On startup, any `pending_order` is reconciled immediately, even mid-bar.
+2. `plan_wake` sleeps until the candle boundary plus `--buffer-sec` (default 2). A bar whose close is already older than `--act-window-sec` (default 30) is skipped: sending then would not be the next open. `--once` does not apply that window; it acts on the latest closed bar when the operator asks.
+3. Candles are paged (`limit=100`) until `min_closed + 2` rows are in hand. The forming bar is dropped. If the just-closed open is missing, the fetch is retried a few times with a short sleep.
+4. One action per closed-bar timestamp. `last_attempt_ts` is set when an order is about to be sent, or when the order is rejected, or when size is below the minimum. A failure does not send again on that bar.
+5. The client order id (32 hex chars, OKX `clOrdId`) is written into `pending_order` and the ledger is replaced **before** `create_order`.
+6. Every order sends `tgtCcy=base_ccy`. See §6.
+7. Network errors leave `pending_order` in place. The next cycle, or the next startup, calls `fetch_order` with that client id. A missing id is retried three times, then the pending record is cleared and the bar stays skipped. Exchange rejects clear the pending record and still keep `last_attempt_ts`.
+8. Other exceptions in the loop are logged. Backoff is `min(300, 5 * 2^(n-1))` seconds. `LedgerError` and `KeyboardInterrupt` still stop the process.
+9. Halt: if `virtual_usdt + virtual_btc * mark < 0.80 * initial_usdt`, buys are skipped. Sells are not.
+
+Mark price is the ticker last, or the last closed close if the ticker call fails. The signal itself does not use the ticker.
+
+## 5. Replay
+
+`replay.py` uses the same `prepare_frame` / vol weight as the live signal. Fills are at the next bar's open. Buy quantity is `(spend / (open * (1+slip))) * (1-fee)`. Sell proceeds are `qty * open * (1-slip) * (1-fee)`. Defaults are 0.10% and 0.05%. Buy-and-hold buys at the first open and is marked to the last close (no exit fee), matching the research benchmark. Data is public OKX OHLCV with no API key and no `create_order`.
+
+That cost model is the research assumption. The live ledger uses the fee the demo fill actually reports, which may not be 10 bps.
+
+## 6. `tgtCcy` (unconfirmed on this account)
+
+OKX spot market **buys** default `sz` to quote currency (`tgtCcy=quote_ccy`). Market sells default to base. ccxt 4.5's `create_order_request` defaults the `tgtCcy` option to `base_ccy` and forwards it, but a client that omits the field follows the venue. This bot sets the option and also passes `tgtCcy=base_ccy` on every order (`execution.spot_market_order_params`).
+
+`--check-order-size` prints the base quantity, the estimated quote, and the params. `--send-demo-check` places a minimum demo buy and an offsetting sell and compares filled base to the requested BTC quantity. It does not update a strategy ledger. That round trip has not been run in this change; the interpretation is still something to confirm on the demo account.
+
+## 7. Tests
+
+`python -m pytest` covers capped buys, quote and base fees (including not double-counting `fee` and `fees`), capped sells, residual dust, atomic replace, unparseable ledgers, reset, the JSONL append, EMA NaN warmup, SPEC SMA warmup, already-long / already-flat / halt decisions, next-open fills, fees on versus off, vol weight below 100%, the three-book replay, pagination to 240 bars, sandbox-header refusal, halt blocking a buy and allowing a sell, reconciliation that does not send a second order, a network error that does not retry the bar, and loop backoff.
+
+`python -m unittest smoke_test.py` still checks SMA warmup, a 3/5 cross, and `extract_fill` fallbacks.
+
+## 8. Limits
+
+- Demo balances and the virtual ledger still diverge if a fill is booked on the exchange and then rejected by `FillRejected`, or if `fetch_order` cannot see a just-accepted id after three tries. `unbooked_order` is set when a returned fill cannot be applied. Check the demo UI when that field is non-null.
+- The assumption “`filled` is gross base and `fee` is not already removed” is what the tests lock in. If a future ccxt build reports net filled, BTC fees would be subtracted twice. The fill log stores both numbers so a bad print is visible.
+- Research numbers in `RESEARCH_SUMMARY.md` used Binance candles. This bot trades OKX demo prints.
+- SPEC v1 is a frozen paper rule, not evidence of a durable edge. Run it next to the other two books.
+- No short, no perp, no ADX filter, no kill of an open buy-and-hold position other than a later manual sell. The halt does not flatten; it only blocks entries.
